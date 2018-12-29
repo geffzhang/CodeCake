@@ -1,4 +1,4 @@
-﻿using Cake.Arguments;
+using Cake.Arguments;
 using Cake.Core;
 using Cake.Core.Configuration;
 using Cake.Core.Diagnostics;
@@ -43,8 +43,8 @@ namespace CodeCake
         /// </param>
         /// <param name="solutionDirectory">
         /// Solution directory: will become the <see cref="ICakeEnvironment.WorkingDirectory"/>.
-        /// When null, if the <see cref="Assembly.GetEntryAssembly()"/> is not null we consider it running in "Solution/Builder/bin/[Configuration}" folder:
-        /// we compute the solution directory by removing 3 sub folders.
+        /// When null, we consider the <see cref="AppContext.BaseDirectory"/> to be running in "Solution/Builder/bin/[Configuration}/[targetFramework]" folder:
+        /// we compute the solution directory by looking for the /bin/ folder and escalating 2 levels.
         /// </param>
         public CodeCakeApplication( IEnumerable<Assembly> codeContainers = null, string solutionDirectory = null )
         {
@@ -59,8 +59,14 @@ namespace CodeCake
             if( solutionDirectory == null && executingAssembly != null )
             {
                 solutionDirectory = new Uri( Assembly.GetEntryAssembly().CodeBase ).LocalPath;
-                solutionDirectory = System.IO.Path.GetDirectoryName( solutionDirectory );
-                solutionDirectory = System.IO.Path.GetDirectoryName( solutionDirectory );
+                while( System.IO.Path.GetFileName( solutionDirectory ) != "bin" )
+                {
+                    solutionDirectory = System.IO.Path.GetDirectoryName( solutionDirectory );
+                    if( string.IsNullOrEmpty( solutionDirectory ) )
+                    {
+                        throw new ArgumentException( $"Unable to find /bin/ folder in AppContext.BaseDirectory = {AppContext.BaseDirectory}. Please provide a non null solution directory.", nameof(solutionDirectory) );
+                    }
+                }
                 solutionDirectory = System.IO.Path.GetDirectoryName( solutionDirectory );
                 solutionDirectory = System.IO.Path.GetDirectoryName( solutionDirectory );
             }
@@ -72,11 +78,11 @@ namespace CodeCake
         /// </summary>
         class SafeCakeLog : IVerbosityAwareLog
         {
-            CakeBuildLog _logger;
+            Cake.Diagnostics.CakeBuildLog _logger;
 
             public SafeCakeLog( CakeConsole c )
             {
-                _logger = new CakeBuildLog( c );
+                _logger = new Cake.Diagnostics.CakeBuildLog( c );
             }
 
             public Verbosity Verbosity
@@ -101,15 +107,19 @@ namespace CodeCake
         /// Runs the application.
         /// </summary>
         /// <param name="args">Arguments.</param>
-        /// <returns>0 on success.</returns>
-        public int Run( string[] args )
+        /// <param name="appRoot">Application root folder</param>
+        /// <returns>The result of the run.</returns>
+        public RunResult Run( string[] args, string appRoot = null)
         {
             var console = new CakeConsole();
             var logger = new SafeCakeLog( console );
-            var engine = new CakeEngine( logger );
+            ICakeDataService dataService = new CodeCakeDataService();
+            var engine = new CakeEngine( dataService, logger );
 
+            ICakePlatform platform = new CakePlatform();
+            ICakeRuntime runtime = new CakeRuntime();
             IFileSystem fileSystem = new FileSystem();
-            MutableCakeEnvironment environment = new MutableCakeEnvironment();
+            MutableCakeEnvironment environment = new MutableCakeEnvironment( platform, runtime, appRoot );
             IGlobber globber = new Globber( fileSystem, environment );
             environment.Initialize( globber );
             IProcessRunner processRunner = new ProcessRunner( environment, logger );
@@ -119,24 +129,21 @@ namespace CodeCake
             CakeOptions options = argumentParser.Parse( args );
             Debug.Assert( options != null );
             CakeConfigurationProvider configProvider = new CakeConfigurationProvider( fileSystem, environment );
-            ICakeConfiguration configuration = configProvider.CreateConfiguration( options.Arguments );
+            ICakeConfiguration configuration = configProvider.CreateConfiguration( environment.ApplicationRoot, options.Arguments );
             IToolRepository toolRepo = new ToolRepository( environment );
             IToolResolutionStrategy toolStrategy = new ToolResolutionStrategy( fileSystem, environment, globber, configuration );
             IToolLocator locator = new ToolLocator( environment, toolRepo, toolStrategy );
             IToolLocator toolLocator = new ToolLocator( environment, toolRepo, toolStrategy  );
             logger.SetVerbosity( options.Verbosity );
+            ICakeArguments arguments = new CakeArguments(options.Arguments);
+            var context = new CakeContext( fileSystem, environment, globber, logger, arguments, processRunner, windowsRegistry, locator, dataService );
+
             CodeCakeBuildTypeDescriptor choosenBuild;
             if( !AvailableBuilds.TryGetValue( options.Script, out choosenBuild ) )
             {
                 logger.Error( "Build script '{0}' not found.", options.Script );
-                return -1;
+                return new RunResult( -1, context.InteractiveMode() );
             }
-
-            ICakeArguments arguments = new CakeArguments(options.Arguments);
-
-            var context = new CakeContext( fileSystem, environment, globber, logger, arguments, processRunner, windowsRegistry, locator );
-
-            // Copy the arguments from the options.
 
             // Set the working directory: the solution directory.
             environment.WorkingDirectory = new DirectoryPath( _solutionDirectory );
@@ -155,8 +162,17 @@ namespace CodeCake
                 CodeCakeHost._injectedActualHost = new BuildScriptHost( engine, context );
                 CodeCakeHost c = (CodeCakeHost)Activator.CreateInstance( choosenBuild.Type );
 
-                var strategy = new DefaultExecutionStrategy( logger );
-                var report = engine.RunTarget( context, strategy, context.Arguments.GetArgument( "target" ) ?? "Default" );
+                var target = context.Arguments.GetArgument( "target" ) ?? "Default";
+                var execSettings = new ExecutionSettings().SetTarget( target );
+                var exclusiveTargetOptional = context.Arguments.HasArgument( "exclusiveOptional" );
+                var exclusiveTarget = exclusiveTargetOptional | context.Arguments.HasArgument( "exclusive" );
+                var strategy = new CodeCakeExecutionStrategy( logger, exclusiveTarget ? target : null );
+                if( exclusiveTargetOptional && !engine.Tasks.Any( t => t.Name == target ) )
+                {
+                    logger.Warning( $"No task '{target}' defined. Since -exclusiveOptional is specified, nothing is done." );
+                    return new RunResult( 0, context.InteractiveMode() );
+                }
+                var report = engine.RunTargetAsync( context, strategy, execSettings ).GetAwaiter().GetResult();
                 if( report != null && !report.IsEmpty )
                 {
                     var printerReport = new CakeReportPrinter( console );
@@ -169,7 +185,7 @@ namespace CodeCake
                 {
                     case CakeTerminationOption.Error:
                         logger.Error( "Termination with Error: '{0}'.", ex.Message );
-                        return -1;
+                        return new RunResult( -2, context.InteractiveMode() );
                     case CakeTerminationOption.Warning:
                         logger.Warning( "Termination with Warning: '{0}'.", ex.Message );
                         break;
@@ -182,23 +198,29 @@ namespace CodeCake
             catch( TargetInvocationException ex )
             {
                 logger.Error( "Error occurred: '{0}'.", ex.InnerException?.Message ?? ex.Message );
-                return -1;
+                return new RunResult( -3, context.InteractiveMode() );
+            }
+            catch( AggregateException ex )
+            {
+                logger.Error( "Error occurred: '{0}'.", ex.Message );
+                foreach( var e in ex.InnerExceptions )
+                {
+                    logger.Error( "  -> '{0}'.", e.Message );
+                }
+                return new RunResult( -4, context.InteractiveMode() );
             }
             catch( Exception ex )
             {
                 logger.Error( "Error occurred: '{0}'.", ex.Message );
-                return -1;
+                return new RunResult( -5, context.InteractiveMode() );
             }
-            return 0;
+            return new RunResult( 0, context.InteractiveMode() );
         }
 
         /// <summary>
         /// Gets a mutable dictionary of build objects.
         /// </summary>
-        public IDictionary<string, CodeCakeBuildTypeDescriptor> AvailableBuilds
-        {
-            get { return _builds; }
-        }
+        public IDictionary<string, CodeCakeBuildTypeDescriptor> AvailableBuilds => _builds; 
 
     }
 }

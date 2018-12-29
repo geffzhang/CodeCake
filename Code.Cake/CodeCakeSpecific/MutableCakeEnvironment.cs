@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 using System.Reflection;
 using Cake.Core.IO;
@@ -16,6 +16,9 @@ namespace CodeCake
     /// </summary>
     public class MutableCakeEnvironment : ICakeEnvironment
     {
+        readonly ICakePlatform _platform;
+        readonly ICakeRuntime _runtime;
+        readonly DirectoryPath _applicationRoot;
         readonly List<string> _paths;
         readonly List<string> _addedPaths;
         readonly List<string> _dynamicPaths;
@@ -32,15 +35,23 @@ namespace CodeCake
         }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="MutableCakeEnvironment"/> class.
+        /// Initializes a new instance of the <see cref="MutableCakeEnvironment" /> class.
         /// </summary>
-        public MutableCakeEnvironment()
+        /// <param name="platform">The platform.</param>
+        /// <param name="runtime">The runtime.</param>
+        /// <param name="appRoot">App root path</param>
+        public MutableCakeEnvironment( ICakePlatform platform, ICakeRuntime runtime, string appRoot = null )
         {
+            _platform = platform;
+            _runtime = runtime;
+            var rootPath = string.IsNullOrEmpty( appRoot ) ? Assembly.GetExecutingAssembly().Location : appRoot;
+            _applicationRoot = System.IO.Path.GetDirectoryName( rootPath );
+
             WorkingDirectory = new DirectoryPath( Environment.CurrentDirectory );
             var pathEnv = Environment.GetEnvironmentVariable( "PATH" );
             if( !string.IsNullOrEmpty( pathEnv ) )
             {
-                _paths = pathEnv.Split( new char[] { Machine.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries )
+                _paths = pathEnv.Split( new char[] { _platform.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries )
                                 .Select( s => s.Trim() )
                                 .Where( s => s.Length > 0 )
                                 .ToList();
@@ -64,21 +75,10 @@ namespace CodeCake
         /// <returns>
         /// Whether or not the current operative system is 64 bit.
         /// </returns>
-        public bool Is64BitOperativeSystem()
-        {
-            return Machine.Is64BitOperativeSystem();
-        }
+        [Obsolete( "Please use CakeEnvironment.Platform.Is64Bit instead." )]
+        public bool Is64BitOperativeSystem() => _platform.Is64Bit;
 
-        /// <summary>
-        /// Determines whether the current machine is running Unix.
-        /// </summary>
-        /// <returns>
-        /// Whether or not the current machine is running Unix.
-        /// </returns>
-        public bool IsUnix()
-        {
-            return Machine.IsUnix();
-        }
+        public bool IsUnix() => _platform.IsUnix();
 
         /// <summary>
         /// Gets a special path.
@@ -113,9 +113,10 @@ namespace CodeCake
         /// <summary>
         /// Gets the application root path.
         /// </summary>
-        /// <returns>
-        /// The application root path.
-        /// </returns>
+        /// <value>The application root path.</value>
+        public DirectoryPath ApplicationRoot => _applicationRoot;
+
+        [Obsolete( "Please use CakeEnvironment.ApplicationRoot instead." )]
         public DirectoryPath GetApplicationRoot()
         {
             var path = System.IO.Path.GetDirectoryName( Assembly.GetExecutingAssembly().Location );
@@ -131,7 +132,7 @@ namespace CodeCake
         /// </returns>
         public string GetEnvironmentVariable( string variable )
         {
-            if( StringComparer.OrdinalIgnoreCase.Equals( variable, "PATH" ) ) return string.Join( Machine.IsUnix() ? ":" : ";", FinalEnvironmentPaths );
+            if( StringComparer.OrdinalIgnoreCase.Equals( variable, "PATH" ) ) return string.Join( _platform.IsUnix() ? ":" : ";", FinalEnvironmentPaths );
             return Environment.GetEnvironmentVariable( variable );
         }
 
@@ -193,6 +194,18 @@ namespace CodeCake
         /// </summary>
         public IEnumerable<string> ExistingPathsFromDynamicPaths => _dynamicPaths.SelectMany( p => _globber.GetDirectories( Environment.ExpandEnvironmentVariables( p ) ).Select( d => d.FullPath ) );
 
+        /// <summary>
+        /// Gets the platform Cake is running on.
+        /// </summary>
+        /// <value>The platform Cake is running on.</value>
+        public ICakePlatform Platform => _platform;
+
+        /// <summary>
+        /// Gets the runtime Cake is running in.
+        /// </summary>
+        /// <value>The runtime Cake is running in.</value>
+        public ICakeRuntime Runtime => _runtime;
+
         private static void SetWorkingDirectory( DirectoryPath path )
         {
             if( path.IsRelative )
@@ -217,19 +230,6 @@ namespace CodeCake
                 key => (string)key.Key,
                 value => value.Value as string,
                 StringComparer.OrdinalIgnoreCase );
-        }
-
-        /// <summary>
-        /// Gets the target .Net framework version that the current AppDomain is targeting.
-        /// </summary>
-        /// <returns>The target framework.</returns>
-        public FrameworkName GetTargetFramework()
-        {
-            // Try to get the current framework name from the current application domain,
-            // but if that is null, we default to .NET 4.5. The reason for doing this is
-            // that this actually is what happens on Mono.
-            var frameworkName = AppDomain.CurrentDomain.SetupInformation.TargetFrameworkName;
-            return new FrameworkName( frameworkName ?? ".NETFramework,Version=v4.5" );
         }
 
     }

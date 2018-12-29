@@ -1,4 +1,4 @@
-﻿using Cake.Common;
+using Cake.Common;
 using Cake.Common.Solution;
 using Cake.Common.IO;
 using Cake.Common.Tools.MSBuild;
@@ -17,62 +17,111 @@ using Cake.Common.Text;
 using System.Diagnostics;
 using System.Collections.Generic;
 using Cake.Core.IO;
+using Cake.Common.Build.AppVeyor;
+using Cake.Common.Build;
+using Cake.Common.Tools.DotNetCore;
+using Cake.Common.Tools.DotNetCore.Build;
 
 namespace CodeCake
 {
     /// <summary>
     /// CodeCakeBuilder for Code.Cake.
     /// </summary>
-    [AddPath( "CodeCakeBuilder/Tools", isDynamicPath: false )]
-    [AddPath( "packages/**/tools*", isDynamicPath: false )]
+    [AddPath( "%UserProfile%/.nuget/packages/**/tools*" )]
     // These dynamic paths are used to test the dynamic path feature itself.
     // This is the default (starting with version v0.8.0).
     [AddPath( "CodeCakeBuilder/**/TestDynamic?", isDynamicPath: true )]
     [AddPath( "CodeCakeBuilder/AutoTests", isDynamicPath: true )]
-    public class Build : CodeCakeHost
+    public partial class Build : CodeCakeHost
     {
         public Build()
         {
+            Cake.Log.Verbosity = Verbosity.Diagnostic;
+
+            const string solutionName = "CodeCake";
+            const string solutionFileName = solutionName + ".sln";
+
             var releasesDir = Cake.Directory( "CodeCakeBuilder/Releases" );
-            string configuration = null;
-            SimpleRepositoryInfo gitInfo = null;
+            Cake.CreateDirectory( releasesDir );
+
+            var projects = Cake.ParseSolution( solutionFileName )
+                                       .Projects
+                                       .Where( p => !(p is SolutionFolder)
+                                                    && p.Name != "CodeCakeBuilder" );
+
+            // We do not publish .Tests projects for this solution.
+            var projectsToPublish = projects.Where( p => !p.Path.Segments.Contains( "Tests" ) );
+
+            // The SimpleRepositoryInfo should be computed once and only once.
+            SimpleRepositoryInfo gitInfo = Cake.GetSimpleRepositoryInfo();
+            // This default global info will be replaced by Check-Repository task.
+            // It is allocated here to ease debugging and/or manual work on complex build script.
+            CheckRepositoryInfo globalInfo = new CheckRepositoryInfo { Version = gitInfo.SafeNuGetVersion };
+
+            Setup( context =>
+            {
+                context.Information( "Executed BEFORE the first task." );
+            } );
+
+            Teardown( context =>
+            {
+                context.Information( "Executed AFTER the last task." );
+            } );
+
+            TaskSetup( setupContext =>
+            {
+                setupContext.Information( $"TaskSetup for Task: {setupContext.Task.Name}" );
+            } );
+
+            TaskTeardown( teardownContext =>
+            {
+                teardownContext.Information( $"TaskTeardown for Task: {teardownContext.Task.Name}" );
+            } );
 
             Task( "Check-Repository" )
                 .Does( () =>
                 {
-                    gitInfo = Cake.GetSimpleRepositoryInfo();
-                    if( !gitInfo.IsValid )
+                    globalInfo = StandardCheckRepository( projectsToPublish, gitInfo );
+                    if( globalInfo.ShouldStop )
                     {
-                        if( Cake.IsInteractiveMode()
-                            && Cake.ReadInteractiveOption( "Repository is not ready to be published. Proceed anyway?", 'Y', 'N' ) == 'Y' )
-                        {
-                            Cake.Warning( "GitInfo is not valid, but you choose to continue..." );
-                        }
-                        else throw new Exception( "Repository is not ready to be published." );
+                        Cake.TerminateWithSuccess( "All packages from this commit are already available. Build skipped." );
                     }
-                    configuration = gitInfo.IsValidRelease && gitInfo.PreReleaseName.Length == 0 ? "Release" : "Debug";
                 } );
 
             Task( "Clean" )
                 .Does( () =>
                 {
-                    // Avoids cleaning CodeCakeBuilder itself!
-                    Cake.CleanDirectories( "**/bin/" + configuration, d => !d.Path.Segments.Contains( "CodeCakeBuilder" ) );
-                    Cake.CleanDirectories( "**/obj/" + configuration, d => !d.Path.Segments.Contains( "CodeCakeBuilder" ) );
+                    Cake.CleanDirectories( projects.Select( p => p.Path.GetDirectory().Combine( "bin" ) ) );
                     Cake.CleanDirectories( releasesDir );
                 } );
 
-            Task( "Restore-NuGet-Packages" )
-                .Does( () =>
-                {
-                    Cake.NuGetRestore( "CodeCake.sln" );
-                } );
-
+            // Use N as the first answser: this test takes a looong time (why?)
+            // In -autointeraction mode, this will be skipped (unless explicitly asked from the command line).
             Task( "AutoTests" )
+               .WithCriteria( () => Cake.InteractiveMode() == InteractiveMode.NoInteraction
+                                    || Cake.ReadInteractiveOption( "RunAutoTests", "Run Auto Tests (for Dynamic paths)?", 'N', 'Y' ) == 'Y')
                .Does( () =>
                {
-                   if( System.IO.Directory.Exists( "CodeCakeBuilder/AutoTests" ) ) Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests", true );
+                   void ShouldFindAutoTestFolderFromDynamicPaths( bool shouldFind )
+                   {
+                       string[] paths = Cake.Environment.GetEnvironmentVariable( "PATH" ).Split( new char[] { Cake.Environment.Platform.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries );
+                       // Cake does not normalize the paths to System.IO.Path.DirectorySeparatorChar. We do it here.
+                       string af = Cake.Environment.WorkingDirectory.FullPath + "/CodeCakeBuilder/AutoTests".Replace( '\\', '/' );
+                       bool autoFolder = paths.Select( p => p.Replace( '\\', '/' ) ).Contains( af );
+                       if( autoFolder != shouldFind ) throw new Exception( shouldFind ? "AutoTests folder should be found." : "AutoTests folder should not be found." );
+                   }
 
+                   void ShouldFindTestTxtFileFromDynamicPaths( bool shouldFind )
+                   {
+                       string[] paths = Cake.Environment.GetEnvironmentVariable( "PATH" ).Split( new char[] { Cake.Environment.Platform.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries );
+                       bool findTestTxtFileInPath = paths.Select( p => System.IO.Path.Combine( p, "Test.txt" ) ).Any( f => System.IO.File.Exists( f ) );
+                       if( findTestTxtFileInPath != shouldFind ) throw new Exception( shouldFind ? "Should find Text.txt file." : "Should not find Test.txt file." );
+                   }
+
+                   if( System.IO.Directory.Exists( "CodeCakeBuilder/AutoTests" ) )
+                   {
+                       Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests", new DeleteDirectorySettings() { Recursive = true, Force = true } );
+                   }
                    ShouldFindAutoTestFolderFromDynamicPaths( false );
                    ShouldFindTestTxtFileFromDynamicPaths( false );
                    Cake.CreateDirectory( "CodeCakeBuilder/AutoTests/TestDynamic0" );
@@ -81,147 +130,44 @@ namespace CodeCake
                    System.IO.File.WriteAllText( "CodeCakeBuilder/AutoTests/TestDynamic0/Test.txt", "c" );
                    ShouldFindAutoTestFolderFromDynamicPaths( true );
                    ShouldFindTestTxtFileFromDynamicPaths( true );
-                   Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests/TestDynamic0", true );
+                   Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests/TestDynamic0", new DeleteDirectorySettings() { Recursive = true, Force = true } );
                    Cake.CreateDirectory( "CodeCakeBuilder/AutoTests/Sub/TestDynamicB" );
                    ShouldFindAutoTestFolderFromDynamicPaths( true );
                    ShouldFindTestTxtFileFromDynamicPaths( false );
                    System.IO.File.WriteAllText( "CodeCakeBuilder/AutoTests/Sub/TestDynamicB/Test.txt", "c" );
                    ShouldFindTestTxtFileFromDynamicPaths( true );
-                   Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests", true );
+                   Cake.DeleteDirectory( "CodeCakeBuilder/AutoTests", new DeleteDirectorySettings() { Recursive = true, Force = true } );
                    ShouldFindTestTxtFileFromDynamicPaths( false );
                    ShouldFindAutoTestFolderFromDynamicPaths( false );
                } );
 
             Task( "Build" )
                 .IsDependentOn( "Clean" )
-                .IsDependentOn( "Restore-NuGet-Packages" )
                 .IsDependentOn( "Check-Repository" )
                 .IsDependentOn( "AutoTests" )
                 .Does( () =>
                 {
-                    Cake.Information( "Building CodeCake.sln with '{0}' configuration (excluding this builder application).", configuration );
-                    using( var tempSln = Cake.CreateTemporarySolutionFile( "CodeCake.sln" ) )
-                    {
-                        tempSln.ExcludeProjectsFromBuild( "CodeCakeBuilder" );
-                        Cake.MSBuild( tempSln.FullPath, new MSBuildSettings()
-                                .SetConfiguration( configuration )
-                                .SetVerbosity( Verbosity.Minimal )
-                                .SetMaxCpuCount( 1 )
-                                // Always generates Xml documentation. Relies on this definition in the csproj files:
-                                //
-                                // <PropertyGroup Condition=" $(GenerateDocumentation) != '' ">
-                                //   <DocumentationFile>bin\$(Configuration)\$(AssemblyName).xml</DocumentationFile>
-                                // </PropertyGroup>
-                                //
-                                .WithProperty( "GenerateDocumentation", new[] { "true" } )
-                            );
-                    }
+                    StandardSolutionBuild( solutionFileName, gitInfo, globalInfo.BuildConfiguration );
                 } );
 
             Task( "Create-NuGet-Packages" )
-                    .IsDependentOn( "Build" )
-                    .WithCriteria( () => gitInfo.IsValid )
-                    .Does( () =>
-                    {
-                        Cake.CreateDirectory( releasesDir );
-                        var settings = new NuGetPackSettings()
-                        {
-                            Version = gitInfo.NuGetVersion,
-                            BasePath = Cake.Environment.WorkingDirectory,
-                            OutputDirectory = releasesDir
-                        };
-                        Cake.CopyFiles( "CodeCakeBuilder/NuSpec/*.nuspec", releasesDir );
-                        foreach( var nuspec in Cake.GetFiles( releasesDir.Path + "/*.nuspec" ) )
-                        {
-                            Cake.TransformTextFile( nuspec, "{{", "}}" )
-                                    .WithToken( "configuration", configuration )
-                                    .WithToken( "CSemVer", gitInfo.SemVer )
-                                    .Save( nuspec );
-                            Cake.NuGetPack( nuspec, settings );
-                        }
-                        Cake.DeleteFiles( releasesDir.Path + "/*.nuspec" );
-                    } );
+                .WithCriteria( () => gitInfo.IsValid )
+                .IsDependentOn( "Build" )
+                .Does( () =>
+                {
+                    StandardCreateNuGetPackages( releasesDir, projectsToPublish, gitInfo, globalInfo.BuildConfiguration );
+                } );
 
             Task( "Push-NuGet-Packages" )
                 .IsDependentOn( "Create-NuGet-Packages" )
                 .WithCriteria( () => gitInfo.IsValid )
-                .Does( () =>
+               .Does( () =>
                 {
-                    IEnumerable<FilePath> nugetPackages = Cake.GetFiles( releasesDir.Path + "/*.nupkg" );
-                    if( Cake.IsInteractiveMode() )
-                    {
-                        var localFeed = Cake.FindDirectoryAbove( "LocalFeed" );
-                        if( localFeed != null )
-                        {
-                            Cake.Information( "LocalFeed directory found: {0}", localFeed );
-                            if( Cake.ReadInteractiveOption( "Do you want to publish to LocalFeed?", 'Y', 'N' ) == 'Y' )
-                            {
-                                Cake.CopyFiles( nugetPackages, localFeed );
-                            }
-                        }
-                    }
-                    if( gitInfo.IsValidRelease )
-                    {
-                        if( gitInfo.PreReleaseName == ""
-                            || gitInfo.PreReleaseName == "prerelease"
-                            || gitInfo.PreReleaseName == "rc" )
-                        {
-                            PushNuGetPackages( "NUGET_API_KEY", "https://www.nuget.org/api/v2/package", nugetPackages );
-                        }
-                        else
-                        {
-                            // An alpha, beta, delta, epsilon, gamma, kappa goes to invenietis-preview.
-                            PushNuGetPackages( "MYGET_PREVIEW_API_KEY", "https://www.myget.org/F/invenietis-preview/api/v2/package", nugetPackages );
-                        }
-                    }
-                    else
-                    {
-                        Debug.Assert( gitInfo.IsValidCIBuild );
-                        PushNuGetPackages( "MYGET_CI_API_KEY", "https://www.myget.org/F/invenietis-ci/api/v2/package", nugetPackages );
-                    }
+                    StandardPushNuGetPackages( globalInfo, releasesDir );
                 } );
 
             Task( "Default" ).IsDependentOn( "Push-NuGet-Packages" );
 
-        }
-
-        private void ShouldFindAutoTestFolderFromDynamicPaths( bool shouldFind )
-        {
-            string[] paths = Cake.Environment.GetEnvironmentVariable( "PATH" ).Split( new char[] { Machine.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries );
-            // Cake does not normalize the paths to System.IO.Path.DirectorySeparatorChar. We do it here.
-            string af = Cake.Environment.WorkingDirectory.FullPath + "/CodeCakeBuilder/AutoTests".Replace( '\\', '/' );
-            bool autoFolder = paths.Select( p => p.Replace( '\\', '/' ) ).Contains( af );
-            if( autoFolder != shouldFind ) throw new Exception( shouldFind ? "AutoTests folder should be found." : "AutoTests folder should not be found." );
-        }
-
-        private void ShouldFindTestTxtFileFromDynamicPaths( bool shouldFind )
-        {
-            string[] paths = Cake.Environment.GetEnvironmentVariable( "PATH" ).Split( new char[] { Machine.IsUnix() ? ':' : ';' }, StringSplitOptions.RemoveEmptyEntries );
-            bool findTestTxtFileInPath = paths.Select( p => System.IO.Path.Combine( p, "Test.txt" ) ).Any( f => System.IO.File.Exists( f ) );
-            if( findTestTxtFileInPath != shouldFind ) throw new Exception( shouldFind ? "Should find Text.txt file." : "Should not find Test.txt file." );
-        }
-
-        private void PushNuGetPackages( string apiKeyName, string pushUrl, IEnumerable<FilePath> nugetPackages )
-        {
-            // Resolves the API key.
-            var apiKey = Cake.InteractiveEnvironmentVariable( apiKeyName );
-            if( string.IsNullOrEmpty( apiKey ) )
-            {
-                Cake.Information( "Could not resolve {0}. Push to {1} is skipped.", apiKeyName, pushUrl );
-            }
-            else
-            {
-                var settings = new NuGetPushSettings
-                {
-                    Source = pushUrl,
-                    ApiKey = apiKey
-                };
-
-                foreach( var nupkg in nugetPackages )
-                {
-                    Cake.NuGetPush( nupkg, settings );
-                }
-            }
         }
     }
 }
